@@ -423,34 +423,45 @@ std::vector<torch::Tensor> ring_attention_forward(
 }
 
 std::vector<torch::Tensor> ring_attention_qkvpacked_forward(
-    const std::vector<torch::Tensor> &Qs, 
-    const std::vector<torch::Tensor> &Ks, 
-    const std::vector<torch::Tensor> &Vs, 
+    const std::vector<torch::Tensor> &QKVs, 
     bool causal
 ) {
-    // Input checking (up to CHECK_INPUTS<...>) takes about 3us 
-    TORCH_CHECK(Qs.size() == NUM_DEVICES, "Qs must be of size ", NUM_DEVICES);
-    TORCH_CHECK(Ks.size() == NUM_DEVICES, "Ks must be of size ", NUM_DEVICES);
-    TORCH_CHECK(Vs.size() == NUM_DEVICES, "Vs must be of size ", NUM_DEVICES);
+    // Input checking
+    TORCH_CHECK(QKVs.size() == NUM_DEVICES, "QKVs must be of size ", NUM_DEVICES);
 
-    
-    int64_t B    = Qs[0].size(0);
-    int64_t H_qo = Qs[0].size(1);
-    int64_t H_kv = Ks[0].size(1);
-    int64_t N    = Qs[0].size(2); // per-block sequence length
-    int64_t D_h  = Qs[0].size(3);
+    int64_t B    = QKVs[0].size(0);  // batch_size
+    int64_t N    = QKVs[0].size(1);  // seqlen
+    int64_t H_qo = QKVs[0].size(3);  // nheads
+    int64_t D_h  = QKVs[0].size(4);  // d
 
-    TORCH_CHECK(H_qo >= H_kv, "QO heads must be greater than or equal to KV heads");
-    TORCH_CHECK(H_qo % H_kv == 0, "QO heads must be divisible by KV heads");
-
-    CHECK_INPUTS<0, NUM_DEVICES>::apply(B, H_qo, H_kv, N, D_h, Qs, Ks, Vs);
-
-    // TODO: support different head sizes
-    TORCH_CHECK(H_qo == H_kv, "For now, different head sizes not supported");
-    // TODO: support different head dims
+    TORCH_CHECK(QKVs[0].size(2) == 3, "QKV tensor must have dimension 2 equal to 3 (Q, K, V)");
     TORCH_CHECK(D_h == 64, "For now, head dim must be 64");
-    // TODO: support causal attention
     TORCH_CHECK(!causal, "Causal attention not supported yet");
+
+    // Check all QKV tensors have the same shape
+    for (int i = 1; i < NUM_DEVICES; ++i) {
+        TORCH_CHECK(QKVs[i].size(0) == B, "QKV batch dimension (device ", i, ") does not match");
+        TORCH_CHECK(QKVs[i].size(1) == N, "QKV sequence length dimension (device ", i, ") does not match");
+        TORCH_CHECK(QKVs[i].size(2) == 3, "QKV QKV dimension (device ", i, ") does not match");
+        TORCH_CHECK(QKVs[i].size(3) == H_qo, "QKV head dimension (device ", i, ") does not match");
+        TORCH_CHECK(QKVs[i].size(4) == D_h, "QKV feature dimension (device ", i, ") does not match");
+    }
+
+    // Split QKV packed tensors into separate Q, K, V tensors using slicing
+    // QKV layout: [batch_size, seqlen, 3, nheads, d]
+    // Extract Q: qkv[:, :, 0, :, :], K: qkv[:, :, 1, :, :], V: qkv[:, :, 2, :, :]
+    std::vector<torch::Tensor> Qs(NUM_DEVICES);
+    std::vector<torch::Tensor> Ks(NUM_DEVICES);
+    std::vector<torch::Tensor> Vs(NUM_DEVICES);
+    
+    for (int i = 0; i < NUM_DEVICES; ++i) {
+        // Q: qkv[:, :, 0, :, :]
+        Qs[i] = QKVs[i].select(2, 0);
+        // K: qkv[:, :, 1, :, :]  
+        Ks[i] = QKVs[i].select(2, 1);
+        // V: qkv[:, :, 2, :, :]
+        Vs[i] = QKVs[i].select(2, 2);
+    }
 
     // Initialize the KC threadpool
     int device_ids[NUM_DEVICES];
@@ -485,8 +496,8 @@ std::vector<torch::Tensor> ring_attention_qkvpacked_forward(
     std::vector<O_gl> g_O;
     for (int dev_idx = 0; dev_idx < NUM_DEVICES; ++dev_idx) {
         g_Q.push_back(Q_gl(d_Q[dev_idx], B, H_qo, N, D_h));
-        g_K.push_back(K_gl(d_K[dev_idx], B, H_kv, N, D_h));
-        g_V.push_back(V_gl(d_V[dev_idx], B, H_kv, N, D_h));
+        g_K.push_back(K_gl(d_K[dev_idx], B, H_qo, N, D_h));
+        g_V.push_back(V_gl(d_V[dev_idx], B, H_qo, N, D_h));
         g_O.push_back(O_gl(d_O[dev_idx], B, H_qo, N, D_h));
     }
     pglobals p_G{g_Q.data(), g_K.data(), g_V.data(), g_O.data(), static_cast<int>(N)};
@@ -494,12 +505,11 @@ std::vector<torch::Tensor> ring_attention_qkvpacked_forward(
     // Initialize and run the kernel
     TORCH_CHECK(N % (CONSUMER_WARPGROUPS * kittens::TILE_ROW_DIM<bf16> * 4) == 0, "sequence length must be divisible by 192");
     dim3 grid(N / (CONSUMER_WARPGROUPS * kittens::TILE_ROW_DIM<bf16> * 4), H_qo, B);
-
     constexpr int smem = kittens::MAX_SHARED_MEMORY;
 
     club.execute([&](int i) {
-        cudaFuncSetAttribute(blockwise_attn_ker<64, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-        blockwise_attn_ker<64, false><<<grid, NUM_WORKERS * kittens::WARP_THREADS, smem, streams[i]>>>(p_G, i);
+        cudaFuncSetAttribute(blockwise_attn_kernel<64, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        blockwise_attn_kernel<64, false><<<grid, NUM_WORKERS * kittens::WARP_THREADS, smem, streams[i]>>>(p_G, i);
         cudaStreamSynchronize(streams[i]);
         CHECK_CUDA_ERROR(cudaGetLastError());
     });
@@ -619,6 +629,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "ring_mha_forward",  
         torch::wrap_pybind_function(ring_attention_forward),
         "Forward ring MHA"
+    );
+    m.def(
+        "ring_mha_qkvpacked_forward",  
+        torch::wrap_pybind_function(ring_attention_qkvpacked_forward),
+        "Forward ring MHA with QKV packed tensors"
     );
     m.def(
         "ring_mha_backward", 
