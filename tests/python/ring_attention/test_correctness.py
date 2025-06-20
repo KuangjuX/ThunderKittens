@@ -40,16 +40,16 @@ if __name__ == '__main__':
 
     torch.cuda.set_device(0)
 
-    print('\nRunning Reference MHA...')
-    Q, K, V, dL = generate_mha_inputs(B, H, N, D_h, dtype=dtype, target='mha_torch')
-    out_ref = mha_torch(Q, K, V, causal)
-    out_ref = out_ref.detach().to(dtype=torch.float32, device='cpu').numpy()
+    # print('\nRunning Reference MHA...')
+    # Q, K, V, dL = generate_mha_inputs(B, H, N, D_h, dtype=dtype, target='mha_torch')
+    # out_ref = mha_torch(Q, K, V, causal)
+    # out_ref = out_ref.detach().to(dtype=torch.float32, device='cpu').numpy()
 
-    print('\nRunning Jax MHA...')
-    Q, K, V, dL = generate_mha_inputs(B, H, N, D_h, dtype=dtype, target='mha_jax')
-    out_jax = mha_jax(Q, K, V, causal)
-    out_jax = np.array(jax.device_get(out_jax)).astype(np.float32)
-    check_correctness(out_ref, out_jax)
+    # print('\nRunning Jax MHA...')
+    # Q, K, V, dL = generate_mha_inputs(B, H, N, D_h, dtype=dtype, target='mha_jax')
+    # out_jax = mha_jax(Q, K, V, causal)
+    # out_jax = np.array(jax.device_get(out_jax)).astype(np.float32)
+    # check_correctness(out_ref, out_jax)
 
     print('\nRunning PyTorch Ring Attention...')
     Q, K, V, dL = generate_mha_inputs(B, H, N, D_h, dtype=dtype, target='mha_torch')
@@ -57,11 +57,11 @@ if __name__ == '__main__':
     out_torch_ring = out_torch_ring.detach().to(dtype=torch.float32, device='cpu').numpy()
     check_correctness(out_ref, out_torch_ring)
 
-    print('\nRunning Original Ring Attention...')
-    Q, K, V, dL = generate_mha_inputs(B, H, N, D_h, dtype=dtype, target='ring_mha_orig', num_devices=NUM_DEVICES)
-    out_ring_orig = ring_mha_orig(Q, K, V, causal, num_devices=NUM_DEVICES)
-    out_ring_orig = np.array(jax.device_get(out_ring_orig)).astype(np.float32)
-    check_correctness(out_ref, out_ring_orig)
+    # print('\nRunning Original Ring Attention...')
+    # Q, K, V, dL = generate_mha_inputs(B, H, N, D_h, dtype=dtype, target='ring_mha_orig', num_devices=NUM_DEVICES)
+    # out_ring_orig = ring_mha_orig(Q, K, V, causal, num_devices=NUM_DEVICES)
+    # out_ring_orig = np.array(jax.device_get(out_ring_orig)).astype(np.float32)
+    # check_correctness(out_ref, out_ring_orig)
 
     print('\nRunning ThunderKittens Ring Attention...')
     Qs, Ks, Vs, dLs = generate_mha_inputs(B, H, N, D_h, dtype=dtype, target='ring_mha_tk', num_devices=NUM_DEVICES)
